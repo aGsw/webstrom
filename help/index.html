@@ -1,0 +1,526 @@
+
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <title>Org Chart Editor with Assistants</title>
+  <!-- Copyright 1998-2020 by Northwoods Software Corporation. -->
+  <meta name="description" content="An organization chart editor with assistants shown on the side -- edit details and change relationships." />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://unpkg.com/gojs/release/go-debug.js"></script>
+  <script id="code">
+    function init() {
+      if (window.goSamples) goSamples();  // init for these samples -- you don't need to call this
+      var $ = go.GraphObject.make;  // for conciseness in defining templates
+
+      myDiagram =
+        $(go.Diagram, "myDiagramDiv", // must be the ID or reference to div
+          {
+            initialAutoScale: go.Diagram.Uniform,
+            maxSelectionCount: 1, // users can select only one part at a time
+            validCycle: go.Diagram.CycleDestinationTree, // make sure users can only create trees
+            "clickCreatingTool.archetypeNodeData": { // allow double-click in background to create a new node
+              name: "(new person)",
+              title: "",
+              comments: ""
+            },
+            "clickCreatingTool.insertPart": function(loc) {  // scroll to the new node
+              var node = go.ClickCreatingTool.prototype.insertPart.call(this, loc);
+              if (node !== null) {
+                this.diagram.select(node);
+                this.diagram.commandHandler.scrollToPart(node);
+                this.diagram.commandHandler.editTextBlock(node.findObject("NAMETB"));
+              }
+              return node;
+            },
+            layout:
+              $(SideTreeLayout,
+                {
+                  treeStyle: go.TreeLayout.StyleLastParents,
+                  arrangement: go.TreeLayout.ArrangementHorizontal,
+                  // properties for most of the tree:
+                  angle: 90,
+                  layerSpacing: 35,
+                  // properties for the "last parents":
+                  alternateAngle: 90,
+                  alternateLayerSpacing: 35,
+                  alternateAlignment: go.TreeLayout.AlignmentBus,
+                  alternateNodeSpacing: 20
+                }),
+            "undoManager.isEnabled": true // enable undo & redo
+          });
+
+      // when the document is modified, add a "*" to the title and enable the "Save" button
+      myDiagram.addDiagramListener("Modified", function(e) {
+        var button = document.getElementById("SaveButton");
+        if (button) button.disabled = !myDiagram.isModified;
+        var idx = document.title.indexOf("*");
+        if (myDiagram.isModified) {
+          if (idx < 0) document.title += "*";
+        } else {
+          if (idx >= 0) document.title = document.title.substr(0, idx);
+        }
+      });
+
+      // manage boss info manually when a node or link is deleted from the diagram
+      myDiagram.addDiagramListener("SelectionDeleting", function(e) {
+        var part = e.subject.first(); // e.subject is the myDiagram.selection collection,
+        // so we'll get the first since we know we only have one selection
+        myDiagram.startTransaction("clear boss");
+        if (part instanceof go.Node) {
+          var it = part.findTreeChildrenNodes(); // find all child nodes
+          while (it.next()) { // now iterate through them and clear out the boss information
+            var child = it.value;
+            var bossText = child.findObject("boss"); // since the boss TextBlock is named, we can access it by name
+            if (bossText === null) return;
+            bossText.text = "";
+          }
+        } else if (part instanceof go.Link) {
+          var child = part.toNode;
+          var bossText = child.findObject("boss"); // since the boss TextBlock is named, we can access it by name
+          if (bossText === null) return;
+          bossText.text = "";
+        }
+        myDiagram.commitTransaction("clear boss");
+      });
+
+      var levelColors = ["#AC193D", "#2672EC", "#8C0095", "#5133AB",
+        "#008299", "#D24726", "#008A00", "#094AB2"];
+
+      // override TreeLayout.commitNodes to also modify the background brush based on the tree depth level
+      myDiagram.layout.commitNodes = function() {
+        go.TreeLayout.prototype.commitNodes.call(myDiagram.layout);  // do the standard behavior
+        // then go through all of the vertexes and set their corresponding node's Shape.fill
+        // to a brush dependent on the TreeVertex.level value
+        myDiagram.layout.network.vertexes.each(function(v) {
+          if (v.node) {
+            var level = v.level % (levelColors.length);
+            var color = levelColors[level];
+            var shape = v.node.findObject("SHAPE");
+            if (shape) shape.fill = $(go.Brush, "Linear", { 0: color, 1: go.Brush.lightenBy(color, 0.05), start: go.Spot.Left, end: go.Spot.Right });
+          }
+        });
+      };
+
+      // when a node is double-clicked, add a child to it
+      function nodeDoubleClick(e, obj) {
+        var clicked = obj.part;
+        if (clicked !== null) {
+          var thisemp = clicked.data;
+          myDiagram.startTransaction("add employee");
+          var newemp = {
+            name: "(new person)",
+            title: "",
+            comments: "",
+            parent: thisemp.key
+          };
+          myDiagram.model.addNodeData(newemp);
+          myDiagram.commitTransaction("add employee");
+        }
+      }
+
+      // this is used to determine feedback during drags
+      function mayWorkFor(node1, node2) {
+        if (!(node1 instanceof go.Node)) return false;  // must be a Node
+        if (node1 === node2) return false;  // cannot work for yourself
+        if (node2.isInTreeOf(node1)) return false;  // cannot work for someone who works for you
+        return true;
+      }
+
+      // This function provides a common style for most of the TextBlocks.
+      // Some of these values may be overridden in a particular TextBlock.
+      function textStyle() {
+        return { font: "9pt  Segoe UI,sans-serif", stroke: "white" };
+      }
+
+      // This converter is used by the Picture.
+      function findHeadShot(key) {
+        if (key < 0 || key > 16) return "images/HSnopic.png"; // There are only 16 images on the server
+        return "images/HS" + key + ".png"
+      }
+
+      // define the Node template
+      myDiagram.nodeTemplate =
+        $(go.Node, "Auto",
+          { doubleClick: nodeDoubleClick },
+          { // handle dragging a Node onto a Node to (maybe) change the reporting relationship
+            mouseDragEnter: function(e, node, prev) {
+              var diagram = node.diagram;
+              var selnode = diagram.selection.first();
+              if (!mayWorkFor(selnode, node)) return;
+              var shape = node.findObject("SHAPE");
+              if (shape) {
+                shape._prevFill = shape.fill;  // remember the original brush
+                shape.fill = "darkred";
+              }
+            },
+            mouseDragLeave: function(e, node, next) {
+              var shape = node.findObject("SHAPE");
+              if (shape && shape._prevFill) {
+                shape.fill = shape._prevFill;  // restore the original brush
+              }
+            },
+            mouseDrop: function(e, node) {
+              var diagram = node.diagram;
+              var selnode = diagram.selection.first();  // assume just one Node in selection
+              if (mayWorkFor(selnode, node)) {
+                // find any existing link into the selected node
+                var link = selnode.findTreeParentLink();
+                if (link !== null) {  // reconnect any existing link
+                  link.fromNode = node;
+                } else {  // else create a new link
+                  diagram.toolManager.linkingTool.insertLink(node, node.port, selnode, selnode.port);
+                }
+              }
+            }
+          },
+          // for sorting, have the Node.text be the data.name
+          new go.Binding("text", "name"),
+          // bind the Part.layerName to control the Node's layer depending on whether it isSelected
+          new go.Binding("layerName", "isSelected", function(sel) { return sel ? "Foreground" : ""; }).ofObject(),
+          // define the node's outer shape
+          $(go.Shape, "Rectangle",
+            {
+              name: "SHAPE", fill: "white", stroke: null,
+              // set the port properties:
+              portId: "", fromLinkable: true, toLinkable: true, cursor: "pointer"
+            }),
+          $(go.Panel, "Horizontal",
+            $(go.Picture,
+              {
+                name: "Picture",
+                desiredSize: new go.Size(39, 50),
+                margin: new go.Margin(6, 8, 6, 10),
+              },
+              new go.Binding("source", "key", findHeadShot)),
+            // define the panel where the text will appear
+            $(go.Panel, "Table",
+              {
+                maxSize: new go.Size(150, 999),
+                margin: new go.Margin(6, 10, 0, 3),
+                defaultAlignment: go.Spot.Left
+              },
+              $(go.RowColumnDefinition, { column: 2, width: 4 }),
+              $(go.TextBlock, textStyle(),  // the name
+                {
+                  name: "NAMETB",
+                  row: 0, column: 0, columnSpan: 5,
+                  font: "12pt Segoe UI,sans-serif",
+                  editable: true, isMultiline: false,
+                  minSize: new go.Size(10, 16)
+                },
+                new go.Binding("text", "name").makeTwoWay()),
+              $(go.TextBlock, "Title: ", textStyle(),
+                { row: 1, column: 0 }),
+              $(go.TextBlock, textStyle(),
+                {
+                  row: 1, column: 1, columnSpan: 4,
+                  editable: true, isMultiline: false,
+                  minSize: new go.Size(10, 14),
+                  margin: new go.Margin(0, 0, 0, 3)
+                },
+                new go.Binding("text", "title").makeTwoWay()),
+              $(go.TextBlock, textStyle(),
+                { row: 2, column: 0 },
+                new go.Binding("text", "key", function(v) { return "ID: " + v; })),
+              $(go.TextBlock, textStyle(),
+                { name: "boss", row: 2, column: 3, }, // we include a name so we can access this TextBlock when deleting Nodes/Links
+                new go.Binding("text", "parent", function(v) { return "Boss: " + v; })),
+              $(go.TextBlock, textStyle(),  // the comments
+                {
+                  row: 3, column: 0, columnSpan: 5,
+                  font: "italic 9pt sans-serif",
+                  wrap: go.TextBlock.WrapFit,
+                  editable: true,  // by default newlines are allowed
+                  minSize: new go.Size(10, 14)
+                },
+                new go.Binding("text", "comments").makeTwoWay())
+            )  // end Table Panel
+          ) // end Horizontal Panel
+        );  // end Node
+
+      // the context menu allows users to make a position vacant,
+      // remove a role and reassign the subtree, or remove a department
+      myDiagram.nodeTemplate.contextMenu =
+        $("ContextMenu",
+          $("ContextMenuButton",
+            $(go.TextBlock, "Vacate Position"),
+            {
+              click: function(e, obj) {
+                var node = obj.part.adornedPart;
+                if (node !== null) {
+                  var thisemp = node.data;
+                  myDiagram.startTransaction("vacate");
+                  // update the key, name, and comments
+                  myDiagram.model.setDataProperty(thisemp, "name", "(Vacant)");
+                  myDiagram.model.setDataProperty(thisemp, "comments", "");
+                  myDiagram.commitTransaction("vacate");
+                }
+              }
+            }
+          ),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Remove Role"),
+            {
+              click: function(e, obj) {
+                // reparent the subtree to this node's boss, then remove the node
+                var node = obj.part.adornedPart;
+                if (node !== null) {
+                  myDiagram.startTransaction("reparent remove");
+                  var chl = node.findTreeChildrenNodes();
+                  // iterate through the children and set their parent key to our selected node's parent key
+                  while (chl.next()) {
+                    var emp = chl.value;
+                    myDiagram.model.setParentKeyForNodeData(emp.data, node.findTreeParentNode().data.key);
+                  }
+                  // and now remove the selected node itself
+                  myDiagram.model.removeNodeData(node.data);
+                  myDiagram.commitTransaction("reparent remove");
+                }
+              }
+            }
+          ),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Remove Department"),
+            {
+              click: function(e, obj) {
+                // remove the whole subtree, including the node itself
+                var node = obj.part.adornedPart;
+                if (node !== null) {
+                  myDiagram.startTransaction("remove dept");
+                  myDiagram.removeParts(node.findTreeParts());
+                  myDiagram.commitTransaction("remove dept");
+                }
+              }
+            }
+          ),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Toggle Assistant"),
+            {
+              click: function(e, obj) {
+                // remove the whole subtree, including the node itself
+                var node = obj.part.adornedPart;
+                if (node !== null) {
+                  myDiagram.startTransaction("toggle assistant");
+                  myDiagram.model.setDataProperty(node.data, "isAssistant", !node.data.isAssistant);
+                  myDiagram.layout.invalidateLayout();
+                  myDiagram.commitTransaction("toggle assistant");
+                }
+              }
+            }
+          )
+        );
+
+      // define the Link template
+      myDiagram.linkTemplate =
+        $(go.Link, go.Link.Orthogonal,
+          { corner: 5, relinkableFrom: true, relinkableTo: true },
+          $(go.Shape, { strokeWidth: 4, stroke: "#00a4a4" }));  // the link shape
+
+      // read in the JSON-format data from the "mySavedModel" element
+      load();
+
+
+      // support editing the properties of the selected person in HTML
+      if (window.Inspector) myInspector = new Inspector("myInspector", myDiagram,
+        {
+          properties: {
+            "key": { readOnly: true },
+            "comments": {},
+            "isAssistant": { type: "boolean" }
+          },
+          propertyModified: function(name, val) {
+            if (name === "isAssistant") myDiagram.layout.invalidateLayout();
+          }
+        });
+    }
+
+
+    // Assume that the SideTreeLayout determines whether a node is an "assistant" if a particular data property is true.
+    // You can adapt this code to decide according to your app's needs.
+    function isAssistant(n) {
+      if (n === null) return false;
+      return n.data.isAssistant;
+    }
+
+
+    // This is a custom TreeLayout that knows about "assistants".
+    // A Node for which isAssistant(n) is true will be placed at the side below the parent node
+    // but above all of the other child nodes.
+    // An assistant node may be the root of its own subtree.
+    // An assistant node may have its own assistant nodes.
+    function SideTreeLayout() {
+      go.TreeLayout.call(this);
+    }
+    go.Diagram.inherit(SideTreeLayout, go.TreeLayout);
+
+    SideTreeLayout.prototype.makeNetwork = function(coll) {
+      var net = go.TreeLayout.prototype.makeNetwork.call(this, coll);
+      // copy the collection of TreeVertexes, because we will modify the network
+      var vertexcoll = new go.Set(/*go.TreeVertex*/);
+      vertexcoll.addAll(net.vertexes);
+      for (var it = vertexcoll.iterator; it.next();) {
+        var parent = it.value;
+        // count the number of assistants
+        var acount = 0;
+        var ait = parent.destinationVertexes;
+        while (ait.next()) {
+          if (isAssistant(ait.value.node)) acount++;
+        }
+        // if a vertex has some number of children that should be assistants
+        if (acount > 0) {
+          // remember the assistant edges and the regular child edges
+          var asstedges = new go.Set(/*go.TreeEdge*/);
+          var childedges = new go.Set(/*go.TreeEdge*/);
+          var eit = parent.destinationEdges;
+          while (eit.next()) {
+            var e = eit.value;
+            if (isAssistant(e.toVertex.node)) {
+              asstedges.add(e);
+            } else {
+              childedges.add(e);
+            }
+          }
+          // first remove all edges from PARENT
+          eit = asstedges.iterator;
+          while (eit.next()) { parent.deleteDestinationEdge(eit.value); }
+          eit = childedges.iterator;
+          while (eit.next()) { parent.deleteDestinationEdge(eit.value); }
+          // if the number of assistants is odd, add a dummy assistant, to make the count even
+          if (acount % 2 == 1) {
+            var dummy = net.createVertex();
+            net.addVertex(dummy);
+            net.linkVertexes(parent, dummy, asstedges.first().link);
+          }
+          // now PARENT should get all of the assistant children
+          eit = asstedges.iterator;
+          while (eit.next()) {
+            parent.addDestinationEdge(eit.value);
+          }
+          // create substitute vertex to be new parent of all regular children
+          var subst = net.createVertex();
+          net.addVertex(subst);
+          // reparent regular children to the new substitute vertex
+          eit = childedges.iterator;
+          while (eit.next()) {
+            var ce = eit.value;
+            ce.fromVertex = subst;
+            subst.addDestinationEdge(ce);
+          }
+          // finally can add substitute vertex as the final odd child,
+          // to be positioned at the end of the PARENT's immediate subtree.
+          var newedge = net.linkVertexes(parent, subst, null);
+        }
+      }
+      return net;
+    };
+
+    SideTreeLayout.prototype.assignTreeVertexValues = function(v) {
+      // if a vertex has any assistants, use Bus alignment
+      var any = false;
+      var children = v.children;
+      for (var i = 0; i < children.length; i++) {
+        var c = children[i];
+        if (isAssistant(c.node)) {
+          any = true;
+          break;
+        }
+      }
+      if (any) {
+        // this is the parent for the assistant(s)
+        v.alignment = go.TreeLayout.AlignmentBus;  // this is required
+        v.nodeSpacing = 50; // control the distance of the assistants from the parent's main links
+      } else if (v.node == null && v.childrenCount > 0) {
+        // found the substitute parent for non-assistant children
+        //v.alignment = go.TreeLayout.AlignmentCenterChildren;
+        //v.breadthLimit = 3000;
+        v.layerSpacing = 0;
+      }
+    };
+
+    SideTreeLayout.prototype.commitLinks = function() {
+      go.TreeLayout.prototype.commitLinks.call(this);
+      // make sure the middle segment of an orthogonal link does not cross over the assistant subtree
+      var eit = this.network.edges.iterator;
+      while (eit.next()) {
+        var e = eit.value;
+        if (e.link == null) continue;
+        var r = e.link;
+        // does this edge come from a substitute parent vertex?
+        var subst = e.fromVertex;
+        if (subst.node == null && r.routing == go.Link.Orthogonal) {
+          r.updateRoute();
+          r.startRoute();
+          // middle segment goes from point 2 to point 3
+          var p1 = subst.center;  // assume artificial vertex has zero size
+          var p2 = r.getPoint(2).copy();
+          var p3 = r.getPoint(3).copy();
+          var p5 = r.getPoint(r.pointsCount - 1);
+          var dist = 10;
+          if (subst.angle == 270 || subst.angle == 180) dist = -20;
+          if (subst.angle == 90 || subst.angle == 270) {
+            p2.y = p5.y - dist; // (p1.y+p5.y)/2;
+            p3.y = p5.y - dist; // (p1.y+p5.y)/2;
+          } else {
+            p2.x = p5.x - dist; // (p1.x+p5.x)/2;
+            p3.x = p5.x - dist; // (p1.x+p5.x)/2;
+          }
+          r.setPoint(2, p2);
+          r.setPoint(3, p3);
+          r.commitRoute();
+        }
+      }
+    };  // end of SideTreeLayout
+
+
+    // Show the diagram's model in JSON format
+    function save() {
+      document.getElementById("mySavedModel").value = myDiagram.model.toJson();
+      myDiagram.isModified = false;
+    }
+    function load() {
+      myDiagram.model = go.Model.fromJson(document.getElementById("mySavedModel").value);
+      // make sure new data keys are unique positive integers
+      var lastkey = 1;
+      myDiagram.model.makeUniqueKeyFunction = function(model, data) {
+        var k = data.key || lastkey;
+        while (model.findNodeDataForKey(k)) k++;
+        data.key = lastkey = k;
+        return k;
+      };
+    }
+  </script>
+</head>
+<body onload="init()">
+<div id="sample">
+  <div id="myDiagramDiv" style="background-color: #696969; border: solid 1px black; height: 500px"></div>
+  <div>
+    <div id="myInspector">
+
+    </div>
+  </div>
+  <p>
+    This editable organizational chart sample was derived from <a href="orgChartEditor">Org Chart Editor</a>
+    and adds support for "assistant" nodes that are laid out by a custom <a>TreeLayout</a> below the side
+    of the parent node and above the regular child nodes.
+  </p>
+  <p>
+    Whether or not a node is considered to be an "assistant" node is determined by the <code>isAssistant</code> property of the node data.
+    The user can modify this data property via an additional context menu command.
+  </p>
+  <p>
+    Assistant employees may themselves be bosses of their own employees.
+    All of a boss's reports may be assistants.
+  </p>
+  <div>
+    <div>
+      <button id="SaveButton" onclick="save()">Save</button>
+      <button onclick="load()">Load</button>
+      Diagram Model saved in JSON format:
+    </div>
+    <textarea id="mySavedModel" style="width:100%;height:250px">
+        {"class":"go.TreeModel","nodeDataArray":[{"key":1,"name":"dir","title":"root"},{"key":1,"name":".babelrc.js","title":"/Users/apple/WebstormProjects/vue/.babelrc.js","parent":1},{"key":2,"name":".circleci","title":".circleci","parent":1},{"key":3,"name":"config.yml","title":"/Users/apple/WebstormProjects/vue/.circleci/config.yml","parent":2},{"key":4,"name":".editorconfig","title":"/Users/apple/WebstormProjects/vue/.editorconfig","parent":1},{"key":5,"name":".eslintignore","title":"/Users/apple/WebstormProjects/vue/.eslintignore","parent":1},{"key":6,"name":".eslintrc.js","title":"/Users/apple/WebstormProjects/vue/.eslintrc.js","parent":1},{"key":7,"name":".flowconfig","title":"/Users/apple/WebstormProjects/vue/.flowconfig","parent":1},{"key":8,"name":".git","title":".git","parent":1},{"key":9,"name":"FETCH_HEAD","title":"/Users/apple/WebstormProjects/vue/.git/FETCH_HEAD","parent":8},{"key":10,"name":"HEAD","title":"/Users/apple/WebstormProjects/vue/.git/HEAD","parent":8},{"key":11,"name":"ORIG_HEAD","title":"/Users/apple/WebstormProjects/vue/.git/ORIG_HEAD","parent":8},{"key":12,"name":"branches","title":"branches","parent":8},{"key":13,"name":"config","title":"/Users/apple/WebstormProjects/vue/.git/config","parent":8},{"key":14,"name":"description","title":"/Users/apple/WebstormProjects/vue/.git/description","parent":8},{"key":15,"name":"hooks","title":"hooks","parent":8},{"key":16,"name":"applypatch-msg.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/applypatch-msg.sample","parent":15},{"key":17,"name":"commit-msg.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/commit-msg.sample","parent":15},{"key":18,"name":"fsmonitor-watchman.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/fsmonitor-watchman.sample","parent":15},{"key":19,"name":"post-update.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/post-update.sample","parent":15},{"key":20,"name":"pre-applypatch.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/pre-applypatch.sample","parent":15},{"key":21,"name":"pre-commit.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/pre-commit.sample","parent":15},{"key":22,"name":"pre-push.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/pre-push.sample","parent":15},{"key":23,"name":"pre-rebase.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/pre-rebase.sample","parent":15},{"key":24,"name":"pre-receive.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/pre-receive.sample","parent":15},{"key":25,"name":"prepare-commit-msg.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/prepare-commit-msg.sample","parent":15},{"key":26,"name":"update.sample","title":"/Users/apple/WebstormProjects/vue/.git/hooks/update.sample","parent":15},{"key":27,"name":"index","title":"/Users/apple/WebstormProjects/vue/.git/index","parent":8},{"key":28,"name":"info","title":"info","parent":8},{"key":29,"name":"exclude","title":"/Users/apple/WebstormProjects/vue/.git/info/exclude","parent":28},{"key":30,"name":"logs","title":"logs","parent":8},{"key":31,"name":"HEAD","title":"/Users/apple/WebstormProjects/vue/.git/logs/HEAD","parent":30},{"key":32,"name":"refs","title":"refs","parent":30},{"key":33,"name":"heads","title":"heads","parent":32},{"key":34,"name":"dev","title":"/Users/apple/WebstormProjects/vue/.git/logs/refs/heads/dev","parent":33},{"key":35,"name":"remotes","title":"remotes","parent":32},{"key":36,"name":"origin","title":"origin","parent":35},{"key":37,"name":"HEAD","title":"/Users/apple/WebstormProjects/vue/.git/logs/refs/remotes/origin/HEAD","parent":36},{"key":38,"name":"objects","title":"objects","parent":8},{"key":39,"name":"info","title":"info","parent":38},{"key":40,"name":"pack","title":"pack","parent":38},{"key":41,"name":"pack-8d8f5f4f6eaee5f625daab9c14e7b00382119ece.idx","title":"/Users/apple/WebstormProjects/vue/.git/objects/pack/pack-8d8f5f4f6eaee5f625daab9c14e7b00382119ece.idx","parent":40},{"key":42,"name":"pack-8d8f5f4f6eaee5f625daab9c14e7b00382119ece.pack","title":"/Users/apple/WebstormProjects/vue/.git/objects/pack/pack-8d8f5f4f6eaee5f625daab9c14e7b00382119ece.pack","parent":40},{"key":43,"name":"packed-refs","title":"/Users/apple/WebstormProjects/vue/.git/packed-refs","parent":8},{"key":44,"name":"refs","title":"refs","parent":8},{"key":45,"name":"heads","title":"heads","parent":44},{"key":46,"name":"dev","title":"/Users/apple/WebstormProjects/vue/.git/refs/heads/dev","parent":45},{"key":47,"name":"remotes","title":"remotes","parent":44},{"key":48,"name":"origin","title":"origin","parent":47},{"key":49,"name":"HEAD","title":"/Users/apple/WebstormProjects/vue/.git/refs/remotes/origin/HEAD","parent":48},{"key":50,"name":"tags","title":"tags","parent":44},{"key":51,"name":".github","title":".github","parent":1},{"key":52,"name":"CODE_OF_CONDUCT.md","title":"/Users/apple/WebstormProjects/vue/.github/CODE_OF_CONDUCT.md","parent":51},{"key":53,"name":"COMMIT_CONVENTION.md","title":"/Users/apple/WebstormProjects/vue/.github/COMMIT_CONVENTION.md","parent":51},{"key":54,"name":"CONTRIBUTING.md","title":"/Users/apple/WebstormProjects/vue/.github/CONTRIBUTING.md","parent":51},{"key":55,"name":"FUNDING.yml","title":"/Users/apple/WebstormProjects/vue/.github/FUNDING.yml","parent":51},{"key":56,"name":"ISSUE_TEMPLATE","title":"ISSUE_TEMPLATE","parent":51},{"key":57,"name":"config.yml","title":"/Users/apple/WebstormProjects/vue/.github/ISSUE_TEMPLATE/config.yml","parent":56},{"key":58,"name":"PULL_REQUEST_TEMPLATE.md","title":"/Users/apple/WebstormProjects/vue/.github/PULL_REQUEST_TEMPLATE.md","parent":51},{"key":59,"name":".gitignore","title":"/Users/apple/WebstormProjects/vue/.gitignore","parent":1},{"key":60,"name":"BACKERS.md","title":"/Users/apple/WebstormProjects/vue/BACKERS.md","parent":1},{"key":61,"name":"LICENSE","title":"/Users/apple/WebstormProjects/vue/LICENSE","parent":1},{"key":62,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/README.md","parent":1},{"key":63,"name":"benchmarks","title":"benchmarks","parent":1},{"key":64,"name":"big-table","title":"big-table","parent":63},{"key":65,"name":"demo.css","title":"/Users/apple/WebstormProjects/vue/benchmarks/big-table/demo.css","parent":64},{"key":66,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/benchmarks/big-table/index.html","parent":64},{"key":67,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/benchmarks/big-table/style.css","parent":64},{"key":68,"name":"dbmon","title":"dbmon","parent":63},{"key":69,"name":"ENV.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/ENV.js","parent":68},{"key":70,"name":"app.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/app.js","parent":68},{"key":71,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/index.html","parent":68},{"key":72,"name":"lib","title":"lib","parent":68},{"key":73,"name":"memory-stats.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/lib/memory-stats.js","parent":72},{"key":74,"name":"monitor.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/lib/monitor.js","parent":72},{"key":75,"name":"styles.css","title":"/Users/apple/WebstormProjects/vue/benchmarks/dbmon/lib/styles.css","parent":72},{"key":76,"name":"reorder-list","title":"reorder-list","parent":63},{"key":77,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/benchmarks/reorder-list/index.html","parent":76},{"key":78,"name":"ssr","title":"ssr","parent":63},{"key":79,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/benchmarks/ssr/README.md","parent":78},{"key":80,"name":"common.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/ssr/common.js","parent":78},{"key":81,"name":"renderToStream.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/ssr/renderToStream.js","parent":78},{"key":82,"name":"renderToString.js","title":"/Users/apple/WebstormProjects/vue/benchmarks/ssr/renderToString.js","parent":78},{"key":83,"name":"svg","title":"svg","parent":63},{"key":84,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/benchmarks/svg/index.html","parent":83},{"key":85,"name":"uptime","title":"uptime","parent":63},{"key":86,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/benchmarks/uptime/index.html","parent":85},{"key":87,"name":"dist","title":"dist","parent":1},{"key":88,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/dist/README.md","parent":87},{"key":89,"name":"vue.common.dev.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.common.dev.js","parent":87},{"key":90,"name":"vue.common.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.common.js","parent":87},{"key":91,"name":"vue.common.prod.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.common.prod.js","parent":87},{"key":92,"name":"vue.esm.browser.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.esm.browser.js","parent":87},{"key":93,"name":"vue.esm.browser.min.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.esm.browser.min.js","parent":87},{"key":94,"name":"vue.esm.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.esm.js","parent":87},{"key":95,"name":"vue.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.js","parent":87},{"key":96,"name":"vue.min.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.min.js","parent":87},{"key":97,"name":"vue.runtime.common.dev.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.common.dev.js","parent":87},{"key":98,"name":"vue.runtime.common.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.common.js","parent":87},{"key":99,"name":"vue.runtime.common.prod.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.common.prod.js","parent":87},{"key":100,"name":"vue.runtime.esm.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.esm.js","parent":87},{"key":101,"name":"vue.runtime.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.js","parent":87},{"key":102,"name":"vue.runtime.min.js","title":"/Users/apple/WebstormProjects/vue/dist/vue.runtime.min.js","parent":87},{"key":103,"name":"examples","title":"examples","parent":1},{"key":104,"name":"commits","title":"commits","parent":103},{"key":105,"name":"app.js","title":"/Users/apple/WebstormProjects/vue/examples/commits/app.js","parent":104},{"key":106,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/commits/index.html","parent":104},{"key":107,"name":"mock.js","title":"/Users/apple/WebstormProjects/vue/examples/commits/mock.js","parent":104},{"key":108,"name":"elastic-header","title":"elastic-header","parent":103},{"key":109,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/elastic-header/index.html","parent":108},{"key":110,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/elastic-header/style.css","parent":108},{"key":111,"name":"firebase","title":"firebase","parent":103},{"key":112,"name":"app.js","title":"/Users/apple/WebstormProjects/vue/examples/firebase/app.js","parent":111},{"key":113,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/firebase/index.html","parent":111},{"key":114,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/firebase/style.css","parent":111},{"key":115,"name":"grid","title":"grid","parent":103},{"key":116,"name":"grid.js","title":"/Users/apple/WebstormProjects/vue/examples/grid/grid.js","parent":115},{"key":117,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/grid/index.html","parent":115},{"key":118,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/grid/style.css","parent":115},{"key":119,"name":"markdown","title":"markdown","parent":103},{"key":120,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/markdown/index.html","parent":119},{"key":121,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/markdown/style.css","parent":119},{"key":122,"name":"modal","title":"modal","parent":103},{"key":123,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/modal/index.html","parent":122},{"key":124,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/modal/style.css","parent":122},{"key":125,"name":"move-animations","title":"move-animations","parent":103},{"key":126,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/move-animations/index.html","parent":125},{"key":127,"name":"select2","title":"select2","parent":103},{"key":128,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/select2/index.html","parent":127},{"key":129,"name":"svg","title":"svg","parent":103},{"key":130,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/svg/index.html","parent":129},{"key":131,"name":"style.css","title":"/Users/apple/WebstormProjects/vue/examples/svg/style.css","parent":129},{"key":132,"name":"svg.js","title":"/Users/apple/WebstormProjects/vue/examples/svg/svg.js","parent":129},{"key":133,"name":"todomvc","title":"todomvc","parent":103},{"key":134,"name":"app.js","title":"/Users/apple/WebstormProjects/vue/examples/todomvc/app.js","parent":133},{"key":135,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/todomvc/index.html","parent":133},{"key":136,"name":"readme.md","title":"/Users/apple/WebstormProjects/vue/examples/todomvc/readme.md","parent":133},{"key":137,"name":"tree","title":"tree","parent":103},{"key":138,"name":"index.html","title":"/Users/apple/WebstormProjects/vue/examples/tree/index.html","parent":137},{"key":139,"name":"tree.js","title":"/Users/apple/WebstormProjects/vue/examples/tree/tree.js","parent":137},{"key":140,"name":"flow","title":"flow","parent":1},{"key":141,"name":"compiler.js","title":"/Users/apple/WebstormProjects/vue/flow/compiler.js","parent":140},{"key":142,"name":"component.js","title":"/Users/apple/WebstormProjects/vue/flow/component.js","parent":140},{"key":143,"name":"global-api.js","title":"/Users/apple/WebstormProjects/vue/flow/global-api.js","parent":140},{"key":144,"name":"modules.js","title":"/Users/apple/WebstormProjects/vue/flow/modules.js","parent":140},{"key":145,"name":"options.js","title":"/Users/apple/WebstormProjects/vue/flow/options.js","parent":140},{"key":146,"name":"ssr.js","title":"/Users/apple/WebstormProjects/vue/flow/ssr.js","parent":140},{"key":147,"name":"vnode.js","title":"/Users/apple/WebstormProjects/vue/flow/vnode.js","parent":140},{"key":148,"name":"weex.js","title":"/Users/apple/WebstormProjects/vue/flow/weex.js","parent":140},{"key":149,"name":"package.json","title":"/Users/apple/WebstormProjects/vue/package.json","parent":1},{"key":150,"name":"packages","title":"packages","parent":1},{"key":151,"name":"vue-server-renderer","title":"vue-server-renderer","parent":150},{"key":152,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/README.md","parent":151},{"key":153,"name":"basic.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/basic.js","parent":151},{"key":154,"name":"build.dev.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/build.dev.js","parent":151},{"key":155,"name":"build.prod.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/build.prod.js","parent":151},{"key":156,"name":"client-plugin.d.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/client-plugin.d.ts","parent":151},{"key":157,"name":"client-plugin.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/client-plugin.js","parent":151},{"key":158,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/index.js","parent":151},{"key":159,"name":"package.json","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/package.json","parent":151},{"key":160,"name":"server-plugin.d.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/server-plugin.d.ts","parent":151},{"key":161,"name":"server-plugin.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/server-plugin.js","parent":151},{"key":162,"name":"types","title":"types","parent":151},{"key":163,"name":"index.d.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/types/index.d.ts","parent":162},{"key":164,"name":"plugin.d.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/types/plugin.d.ts","parent":162},{"key":165,"name":"tsconfig.json","title":"/Users/apple/WebstormProjects/vue/packages/vue-server-renderer/types/tsconfig.json","parent":162},{"key":166,"name":"vue-template-compiler","title":"vue-template-compiler","parent":150},{"key":167,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/README.md","parent":166},{"key":168,"name":"browser.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/browser.js","parent":166},{"key":169,"name":"build.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/build.js","parent":166},{"key":170,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/index.js","parent":166},{"key":171,"name":"package.json","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/package.json","parent":166},{"key":172,"name":"types","title":"types","parent":166},{"key":173,"name":"index.d.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/types/index.d.ts","parent":172},{"key":174,"name":"test.ts","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/types/test.ts","parent":172},{"key":175,"name":"tsconfig.json","title":"/Users/apple/WebstormProjects/vue/packages/vue-template-compiler/types/tsconfig.json","parent":172},{"key":176,"name":"weex-template-compiler","title":"weex-template-compiler","parent":150},{"key":177,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/packages/weex-template-compiler/README.md","parent":176},{"key":178,"name":"build.js","title":"/Users/apple/WebstormProjects/vue/packages/weex-template-compiler/build.js","parent":176},{"key":179,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/packages/weex-template-compiler/index.js","parent":176},{"key":180,"name":"package.json","title":"/Users/apple/WebstormProjects/vue/packages/weex-template-compiler/package.json","parent":176},{"key":181,"name":"weex-vue-framework","title":"weex-vue-framework","parent":150},{"key":182,"name":"README.md","title":"/Users/apple/WebstormProjects/vue/packages/weex-vue-framework/README.md","parent":181},{"key":183,"name":"factory.js","title":"/Users/apple/WebstormProjects/vue/packages/weex-vue-framework/factory.js","parent":181},{"key":184,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/packages/weex-vue-framework/index.js","parent":181},{"key":185,"name":"package.json","title":"/Users/apple/WebstormProjects/vue/packages/weex-vue-framework/package.json","parent":181},{"key":186,"name":"scripts","title":"scripts","parent":1},{"key":187,"name":"alias.js","title":"/Users/apple/WebstormProjects/vue/scripts/alias.js","parent":186},{"key":188,"name":"build.js","title":"/Users/apple/WebstormProjects/vue/scripts/build.js","parent":186},{"key":189,"name":"config.js","title":"/Users/apple/WebstormProjects/vue/scripts/config.js","parent":186},{"key":190,"name":"feature-flags.js","title":"/Users/apple/WebstormProjects/vue/scripts/feature-flags.js","parent":186},{"key":191,"name":"gen-release-note.js","title":"/Users/apple/WebstormProjects/vue/scripts/gen-release-note.js","parent":186},{"key":192,"name":"get-weex-version.js","title":"/Users/apple/WebstormProjects/vue/scripts/get-weex-version.js","parent":186},{"key":193,"name":"git-hooks","title":"git-hooks","parent":186},{"key":194,"name":"commit-msg","title":"/Users/apple/WebstormProjects/vue/scripts/git-hooks/commit-msg","parent":193},{"key":195,"name":"pre-commit","title":"/Users/apple/WebstormProjects/vue/scripts/git-hooks/pre-commit","parent":193},{"key":196,"name":"release-weex.sh","title":"/Users/apple/WebstormProjects/vue/scripts/release-weex.sh","parent":186},{"key":197,"name":"release.sh","title":"/Users/apple/WebstormProjects/vue/scripts/release.sh","parent":186},{"key":198,"name":"verify-commit-msg.js","title":"/Users/apple/WebstormProjects/vue/scripts/verify-commit-msg.js","parent":186},{"key":199,"name":"src","title":"src","parent":1},{"key":200,"name":".DS_Store","title":"/Users/apple/WebstormProjects/vue/src/.DS_Store","parent":199},{"key":201,"name":"compiler","title":"compiler","parent":199},{"key":202,"name":"codeframe.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/codeframe.js","parent":201},{"key":203,"name":"codegen","title":"codegen","parent":201},{"key":204,"name":"events.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/codegen/events.js","parent":203},{"key":205,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/codegen/index.js","parent":203},{"key":206,"name":"create-compiler.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/create-compiler.js","parent":201},{"key":207,"name":"directives","title":"directives","parent":201},{"key":208,"name":"bind.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/directives/bind.js","parent":207},{"key":209,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/directives/index.js","parent":207},{"key":210,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/directives/model.js","parent":207},{"key":211,"name":"on.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/directives/on.js","parent":207},{"key":212,"name":"error-detector.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/error-detector.js","parent":201},{"key":213,"name":"helpers.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/helpers.js","parent":201},{"key":214,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/index.js","parent":201},{"key":215,"name":"optimizer.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/optimizer.js","parent":201},{"key":216,"name":"parser","title":"parser","parent":201},{"key":217,"name":"entity-decoder.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/parser/entity-decoder.js","parent":216},{"key":218,"name":"filter-parser.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/parser/filter-parser.js","parent":216},{"key":219,"name":"html-parser.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/parser/html-parser.js","parent":216},{"key":220,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/parser/index.js","parent":216},{"key":221,"name":"text-parser.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/parser/text-parser.js","parent":216},{"key":222,"name":"to-function.js","title":"/Users/apple/WebstormProjects/vue/src/compiler/to-function.js","parent":201},{"key":223,"name":"core","title":"core","parent":199},{"key":224,"name":"components","title":"components","parent":223},{"key":225,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/components/index.js","parent":224},{"key":226,"name":"keep-alive.js","title":"/Users/apple/WebstormProjects/vue/src/core/components/keep-alive.js","parent":224},{"key":227,"name":"config.js","title":"/Users/apple/WebstormProjects/vue/src/core/config.js","parent":223},{"key":228,"name":"global-api","title":"global-api","parent":223},{"key":229,"name":"assets.js","title":"/Users/apple/WebstormProjects/vue/src/core/global-api/assets.js","parent":228},{"key":230,"name":"extend.js","title":"/Users/apple/WebstormProjects/vue/src/core/global-api/extend.js","parent":228},{"key":231,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/global-api/index.js","parent":228},{"key":232,"name":"mixin.js","title":"/Users/apple/WebstormProjects/vue/src/core/global-api/mixin.js","parent":228},{"key":233,"name":"use.js","title":"/Users/apple/WebstormProjects/vue/src/core/global-api/use.js","parent":228},{"key":234,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/index.js","parent":223},{"key":235,"name":"instance","title":"instance","parent":223},{"key":236,"name":"events.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/events.js","parent":235},{"key":237,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/index.js","parent":235},{"key":238,"name":"init.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/init.js","parent":235},{"key":239,"name":"inject.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/inject.js","parent":235},{"key":240,"name":"lifecycle.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/lifecycle.js","parent":235},{"key":241,"name":"proxy.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/proxy.js","parent":235},{"key":242,"name":"render-helpers","title":"render-helpers","parent":235},{"key":243,"name":"bind-dynamic-keys.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/bind-dynamic-keys.js","parent":242},{"key":244,"name":"bind-object-listeners.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/bind-object-listeners.js","parent":242},{"key":245,"name":"bind-object-props.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/bind-object-props.js","parent":242},{"key":246,"name":"check-keycodes.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/check-keycodes.js","parent":242},{"key":247,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/index.js","parent":242},{"key":248,"name":"render-list.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/render-list.js","parent":242},{"key":249,"name":"render-slot.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/render-slot.js","parent":242},{"key":250,"name":"render-static.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/render-static.js","parent":242},{"key":251,"name":"resolve-filter.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/resolve-filter.js","parent":242},{"key":252,"name":"resolve-scoped-slots.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/resolve-scoped-slots.js","parent":242},{"key":253,"name":"resolve-slots.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render-helpers/resolve-slots.js","parent":242},{"key":254,"name":"render.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/render.js","parent":235},{"key":255,"name":"state.js","title":"/Users/apple/WebstormProjects/vue/src/core/instance/state.js","parent":235},{"key":256,"name":"observer","title":"observer","parent":223},{"key":257,"name":"array.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/array.js","parent":256},{"key":258,"name":"dep.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/dep.js","parent":256},{"key":259,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/index.js","parent":256},{"key":260,"name":"scheduler.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/scheduler.js","parent":256},{"key":261,"name":"traverse.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/traverse.js","parent":256},{"key":262,"name":"watcher.js","title":"/Users/apple/WebstormProjects/vue/src/core/observer/watcher.js","parent":256},{"key":263,"name":"util","title":"util","parent":223},{"key":264,"name":"debug.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/debug.js","parent":263},{"key":265,"name":"env.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/env.js","parent":263},{"key":266,"name":"error.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/error.js","parent":263},{"key":267,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/index.js","parent":263},{"key":268,"name":"lang.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/lang.js","parent":263},{"key":269,"name":"next-tick.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/next-tick.js","parent":263},{"key":270,"name":"options.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/options.js","parent":263},{"key":271,"name":"perf.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/perf.js","parent":263},{"key":272,"name":"props.js","title":"/Users/apple/WebstormProjects/vue/src/core/util/props.js","parent":263},{"key":273,"name":"vdom","title":"vdom","parent":223},{"key":274,"name":"create-component.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/create-component.js","parent":273},{"key":275,"name":"create-element.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/create-element.js","parent":273},{"key":276,"name":"create-functional-component.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/create-functional-component.js","parent":273},{"key":277,"name":"helpers","title":"helpers","parent":273},{"key":278,"name":"extract-props.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/extract-props.js","parent":277},{"key":279,"name":"get-first-component-child.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/get-first-component-child.js","parent":277},{"key":280,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/index.js","parent":277},{"key":281,"name":"is-async-placeholder.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/is-async-placeholder.js","parent":277},{"key":282,"name":"merge-hook.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/merge-hook.js","parent":277},{"key":283,"name":"normalize-children.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/normalize-children.js","parent":277},{"key":284,"name":"normalize-scoped-slots.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/normalize-scoped-slots.js","parent":277},{"key":285,"name":"resolve-async-component.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/resolve-async-component.js","parent":277},{"key":286,"name":"update-listeners.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/helpers/update-listeners.js","parent":277},{"key":287,"name":"modules","title":"modules","parent":273},{"key":288,"name":"directives.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/modules/directives.js","parent":287},{"key":289,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/modules/index.js","parent":287},{"key":290,"name":"ref.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/modules/ref.js","parent":287},{"key":291,"name":"patch.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/patch.js","parent":273},{"key":292,"name":"vnode.js","title":"/Users/apple/WebstormProjects/vue/src/core/vdom/vnode.js","parent":273},{"key":293,"name":"platforms","title":"platforms","parent":199},{"key":294,"name":"web","title":"web","parent":293},{"key":295,"name":"compiler","title":"compiler","parent":294},{"key":296,"name":"directives","title":"directives","parent":295},{"key":297,"name":"html.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/directives/html.js","parent":296},{"key":298,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/directives/index.js","parent":296},{"key":299,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/directives/model.js","parent":296},{"key":300,"name":"text.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/directives/text.js","parent":296},{"key":301,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/index.js","parent":295},{"key":302,"name":"modules","title":"modules","parent":295},{"key":303,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/modules/class.js","parent":302},{"key":304,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/modules/index.js","parent":302},{"key":305,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/modules/model.js","parent":302},{"key":306,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/modules/style.js","parent":302},{"key":307,"name":"options.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/options.js","parent":295},{"key":308,"name":"util.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/compiler/util.js","parent":295},{"key":309,"name":"entry-compiler.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/entry-compiler.js","parent":294},{"key":310,"name":"entry-runtime-with-compiler.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/entry-runtime-with-compiler.js","parent":294},{"key":311,"name":"entry-runtime.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/entry-runtime.js","parent":294},{"key":312,"name":"entry-server-basic-renderer.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/entry-server-basic-renderer.js","parent":294},{"key":313,"name":"entry-server-renderer.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/entry-server-renderer.js","parent":294},{"key":314,"name":"runtime","title":"runtime","parent":294},{"key":315,"name":"class-util.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/class-util.js","parent":314},{"key":316,"name":"components","title":"components","parent":314},{"key":317,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/components/index.js","parent":316},{"key":318,"name":"transition-group.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/components/transition-group.js","parent":316},{"key":319,"name":"transition.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/components/transition.js","parent":316},{"key":320,"name":"directives","title":"directives","parent":314},{"key":321,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/directives/index.js","parent":320},{"key":322,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/directives/model.js","parent":320},{"key":323,"name":"show.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/directives/show.js","parent":320},{"key":324,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/index.js","parent":314},{"key":325,"name":"modules","title":"modules","parent":314},{"key":326,"name":"attrs.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/attrs.js","parent":325},{"key":327,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/class.js","parent":325},{"key":328,"name":"dom-props.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/dom-props.js","parent":325},{"key":329,"name":"events.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/events.js","parent":325},{"key":330,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/index.js","parent":325},{"key":331,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/style.js","parent":325},{"key":332,"name":"transition.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/modules/transition.js","parent":325},{"key":333,"name":"node-ops.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/node-ops.js","parent":314},{"key":334,"name":"patch.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/patch.js","parent":314},{"key":335,"name":"transition-util.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/runtime/transition-util.js","parent":314},{"key":336,"name":"server","title":"server","parent":294},{"key":337,"name":"compiler.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/compiler.js","parent":336},{"key":338,"name":"directives","title":"directives","parent":336},{"key":339,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/directives/index.js","parent":338},{"key":340,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/directives/model.js","parent":338},{"key":341,"name":"show.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/directives/show.js","parent":338},{"key":342,"name":"modules","title":"modules","parent":336},{"key":343,"name":"attrs.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/modules/attrs.js","parent":342},{"key":344,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/modules/class.js","parent":342},{"key":345,"name":"dom-props.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/modules/dom-props.js","parent":342},{"key":346,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/modules/index.js","parent":342},{"key":347,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/modules/style.js","parent":342},{"key":348,"name":"util.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/server/util.js","parent":336},{"key":349,"name":"util","title":"util","parent":294},{"key":350,"name":"attrs.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/attrs.js","parent":349},{"key":351,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/class.js","parent":349},{"key":352,"name":"compat.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/compat.js","parent":349},{"key":353,"name":"element.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/element.js","parent":349},{"key":354,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/index.js","parent":349},{"key":355,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/web/util/style.js","parent":349},{"key":356,"name":"weex","title":"weex","parent":293},{"key":357,"name":"compiler","title":"compiler","parent":356},{"key":358,"name":"directives","title":"directives","parent":357},{"key":359,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/directives/index.js","parent":358},{"key":360,"name":"model.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/directives/model.js","parent":358},{"key":361,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/index.js","parent":357},{"key":362,"name":"modules","title":"modules","parent":357},{"key":363,"name":"append.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/append.js","parent":362},{"key":364,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/class.js","parent":362},{"key":365,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/index.js","parent":362},{"key":366,"name":"props.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/props.js","parent":362},{"key":367,"name":"recycle-list","title":"recycle-list","parent":362},{"key":368,"name":"component-root.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/component-root.js","parent":367},{"key":369,"name":"component.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/component.js","parent":367},{"key":370,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/index.js","parent":367},{"key":371,"name":"recycle-list.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/recycle-list.js","parent":367},{"key":372,"name":"text.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/text.js","parent":367},{"key":373,"name":"v-bind.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/v-bind.js","parent":367},{"key":374,"name":"v-for.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/v-for.js","parent":367},{"key":375,"name":"v-if.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/v-if.js","parent":367},{"key":376,"name":"v-on.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/v-on.js","parent":367},{"key":377,"name":"v-once.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/recycle-list/v-once.js","parent":367},{"key":378,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/compiler/modules/style.js","parent":362},{"key":379,"name":"entry-compiler.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/entry-compiler.js","parent":356},{"key":380,"name":"entry-framework.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/entry-framework.js","parent":356},{"key":381,"name":"entry-runtime-factory.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/entry-runtime-factory.js","parent":356},{"key":382,"name":"runtime","title":"runtime","parent":356},{"key":383,"name":"components","title":"components","parent":382},{"key":384,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/components/index.js","parent":383},{"key":385,"name":"richtext.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/components/richtext.js","parent":383},{"key":386,"name":"transition-group.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/components/transition-group.js","parent":383},{"key":387,"name":"transition.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/components/transition.js","parent":383},{"key":388,"name":"directives","title":"directives","parent":382},{"key":389,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/directives/index.js","parent":388},{"key":390,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/index.js","parent":382},{"key":391,"name":"modules","title":"modules","parent":382},{"key":392,"name":"attrs.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/attrs.js","parent":391},{"key":393,"name":"class.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/class.js","parent":391},{"key":394,"name":"events.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/events.js","parent":391},{"key":395,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/index.js","parent":391},{"key":396,"name":"style.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/style.js","parent":391},{"key":397,"name":"transition.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/modules/transition.js","parent":391},{"key":398,"name":"node-ops.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/node-ops.js","parent":382},{"key":399,"name":"patch.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/patch.js","parent":382},{"key":400,"name":"recycle-list","title":"recycle-list","parent":382},{"key":401,"name":"render-component-template.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/recycle-list/render-component-template.js","parent":400},{"key":402,"name":"virtual-component.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/recycle-list/virtual-component.js","parent":400},{"key":403,"name":"text-node.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/runtime/text-node.js","parent":382},{"key":404,"name":"util","title":"util","parent":356},{"key":405,"name":"element.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/util/element.js","parent":404},{"key":406,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/util/index.js","parent":404},{"key":407,"name":"parser.js","title":"/Users/apple/WebstormProjects/vue/src/platforms/weex/util/parser.js","parent":404},{"key":408,"name":"server","title":"server","parent":199},{"key":409,"name":"bundle-renderer","title":"bundle-renderer","parent":408},{"key":410,"name":"create-bundle-renderer.js","title":"/Users/apple/WebstormProjects/vue/src/server/bundle-renderer/create-bundle-renderer.js","parent":409},{"key":411,"name":"create-bundle-runner.js","title":"/Users/apple/WebstormProjects/vue/src/server/bundle-renderer/create-bundle-runner.js","parent":409},{"key":412,"name":"source-map-support.js","title":"/Users/apple/WebstormProjects/vue/src/server/bundle-renderer/source-map-support.js","parent":409},{"key":413,"name":"create-basic-renderer.js","title":"/Users/apple/WebstormProjects/vue/src/server/create-basic-renderer.js","parent":408},{"key":414,"name":"create-renderer.js","title":"/Users/apple/WebstormProjects/vue/src/server/create-renderer.js","parent":408},{"key":415,"name":"optimizing-compiler","title":"optimizing-compiler","parent":408},{"key":416,"name":"codegen.js","title":"/Users/apple/WebstormProjects/vue/src/server/optimizing-compiler/codegen.js","parent":415},{"key":417,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/server/optimizing-compiler/index.js","parent":415},{"key":418,"name":"modules.js","title":"/Users/apple/WebstormProjects/vue/src/server/optimizing-compiler/modules.js","parent":415},{"key":419,"name":"optimizer.js","title":"/Users/apple/WebstormProjects/vue/src/server/optimizing-compiler/optimizer.js","parent":415},{"key":420,"name":"runtime-helpers.js","title":"/Users/apple/WebstormProjects/vue/src/server/optimizing-compiler/runtime-helpers.js","parent":415},{"key":421,"name":"render-context.js","title":"/Users/apple/WebstormProjects/vue/src/server/render-context.js","parent":408},{"key":422,"name":"render-stream.js","title":"/Users/apple/WebstormProjects/vue/src/server/render-stream.js","parent":408},{"key":423,"name":"render.js","title":"/Users/apple/WebstormProjects/vue/src/server/render.js","parent":408},{"key":424,"name":"template-renderer","title":"template-renderer","parent":408},{"key":425,"name":"create-async-file-mapper.js","title":"/Users/apple/WebstormProjects/vue/src/server/template-renderer/create-async-file-mapper.js","parent":424},{"key":426,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/src/server/template-renderer/index.js","parent":424},{"key":427,"name":"parse-template.js","title":"/Users/apple/WebstormProjects/vue/src/server/template-renderer/parse-template.js","parent":424},{"key":428,"name":"template-stream.js","title":"/Users/apple/WebstormProjects/vue/src/server/template-renderer/template-stream.js","parent":424},{"key":429,"name":"util.js","title":"/Users/apple/WebstormProjects/vue/src/server/util.js","parent":408},{"key":430,"name":"webpack-plugin","title":"webpack-plugin","parent":408},{"key":431,"name":"client.js","title":"/Users/apple/WebstormProjects/vue/src/server/webpack-plugin/client.js","parent":430},{"key":432,"name":"server.js","title":"/Users/apple/WebstormProjects/vue/src/server/webpack-plugin/server.js","parent":430},{"key":433,"name":"util.js","title":"/Users/apple/WebstormProjects/vue/src/server/webpack-plugin/util.js","parent":430},{"key":434,"name":"write.js","title":"/Users/apple/WebstormProjects/vue/src/server/write.js","parent":408},{"key":435,"name":"sfc","title":"sfc","parent":199},{"key":436,"name":"parser.js","title":"/Users/apple/WebstormProjects/vue/src/sfc/parser.js","parent":435},{"key":437,"name":"shared","title":"shared","parent":199},{"key":438,"name":"constants.js","title":"/Users/apple/WebstormProjects/vue/src/shared/constants.js","parent":437},{"key":439,"name":"util.js","title":"/Users/apple/WebstormProjects/vue/src/shared/util.js","parent":437},{"key":440,"name":"test","title":"test","parent":1},{"key":441,"name":"e2e","title":"e2e","parent":440},{"key":442,"name":".eslintrc.json","title":"/Users/apple/WebstormProjects/vue/test/e2e/.eslintrc.json","parent":441},{"key":443,"name":"nightwatch.config.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/nightwatch.config.js","parent":441},{"key":444,"name":"runner.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/runner.js","parent":441},{"key":445,"name":"specs","title":"specs","parent":441},{"key":446,"name":"async-edge-cases.html","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/async-edge-cases.html","parent":445},{"key":447,"name":"async-edge-cases.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/async-edge-cases.js","parent":445},{"key":448,"name":"basic-ssr.html","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/basic-ssr.html","parent":445},{"key":449,"name":"basic-ssr.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/basic-ssr.js","parent":445},{"key":450,"name":"commits.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/commits.js","parent":445},{"key":451,"name":"grid.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/grid.js","parent":445},{"key":452,"name":"markdown.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/markdown.js","parent":445},{"key":453,"name":"modal.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/modal.js","parent":445},{"key":454,"name":"select2.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/select2.js","parent":445},{"key":455,"name":"svg.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/svg.js","parent":445},{"key":456,"name":"todomvc.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/todomvc.js","parent":445},{"key":457,"name":"tree.js","title":"/Users/apple/WebstormProjects/vue/test/e2e/specs/tree.js","parent":445},{"key":458,"name":"helpers","title":"helpers","parent":440},{"key":459,"name":".eslintrc.json","title":"/Users/apple/WebstormProjects/vue/test/helpers/.eslintrc.json","parent":458},{"key":460,"name":"classlist.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/classlist.js","parent":458},{"key":461,"name":"test-object-option.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/test-object-option.js","parent":458},{"key":462,"name":"to-equal.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/to-equal.js","parent":458},{"key":463,"name":"to-have-been-warned.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/to-have-been-warned.js","parent":458},{"key":464,"name":"trigger-event.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/trigger-event.js","parent":458},{"key":465,"name":"vdom.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/vdom.js","parent":458},{"key":466,"name":"wait-for-update.js","title":"/Users/apple/WebstormProjects/vue/test/helpers/wait-for-update.js","parent":458},{"key":467,"name":"ssr","title":"ssr","parent":440},{"key":468,"name":".eslintrc","title":"/Users/apple/WebstormProjects/vue/test/ssr/.eslintrc","parent":467},{"key":469,"name":"async-loader.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/async-loader.js","parent":467},{"key":470,"name":"compile-with-webpack.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/compile-with-webpack.js","parent":467},{"key":471,"name":"fixtures","title":"fixtures","parent":467},{"key":472,"name":"app.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/app.js","parent":471},{"key":473,"name":"async-bar.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/async-bar.js","parent":471},{"key":474,"name":"async-foo.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/async-foo.js","parent":471},{"key":475,"name":"cache-opt-out.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/cache-opt-out.js","parent":471},{"key":476,"name":"cache.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/cache.js","parent":471},{"key":477,"name":"error.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/error.js","parent":471},{"key":478,"name":"nested-cache.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/nested-cache.js","parent":471},{"key":479,"name":"promise-rejection.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/promise-rejection.js","parent":471},{"key":480,"name":"split.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/split.js","parent":471},{"key":481,"name":"test.css","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/test.css","parent":471},{"key":482,"name":"test.png","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/test.png","parent":471},{"key":483,"name":"test.woff2","title":"/Users/apple/WebstormProjects/vue/test/ssr/fixtures/test.woff2","parent":471},{"key":484,"name":"jasmine.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/jasmine.js","parent":467},{"key":485,"name":"ssr-basic-renderer.spec.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/ssr-basic-renderer.spec.js","parent":467},{"key":486,"name":"ssr-bundle-render.spec.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/ssr-bundle-render.spec.js","parent":467},{"key":487,"name":"ssr-stream.spec.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/ssr-stream.spec.js","parent":467},{"key":488,"name":"ssr-string.spec.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/ssr-string.spec.js","parent":467},{"key":489,"name":"ssr-template.spec.js","title":"/Users/apple/WebstormProjects/vue/test/ssr/ssr-template.spec.js","parent":467},{"key":490,"name":"unit","title":"unit","parent":440},{"key":491,"name":".eslintrc.json","title":"/Users/apple/WebstormProjects/vue/test/unit/.eslintrc.json","parent":490},{"key":492,"name":"features","title":"features","parent":490},{"key":493,"name":"component","title":"component","parent":492},{"key":494,"name":"component-async.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/component/component-async.spec.js","parent":493},{"key":495,"name":"component-keep-alive.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/component/component-keep-alive.spec.js","parent":493},{"key":496,"name":"component-scoped-slot.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/component/component-scoped-slot.spec.js","parent":493},{"key":497,"name":"component-slot.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/component/component-slot.spec.js","parent":493},{"key":498,"name":"component.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/component/component.spec.js","parent":493},{"key":499,"name":"debug.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/debug.spec.js","parent":492},{"key":500,"name":"directives","title":"directives","parent":492},{"key":501,"name":"bind.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/bind.spec.js","parent":500},{"key":502,"name":"class.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/class.spec.js","parent":500},{"key":503,"name":"cloak.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/cloak.spec.js","parent":500},{"key":504,"name":"for.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/for.spec.js","parent":500},{"key":505,"name":"html.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/html.spec.js","parent":500},{"key":506,"name":"if.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/if.spec.js","parent":500},{"key":507,"name":"model-checkbox.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-checkbox.spec.js","parent":500},{"key":508,"name":"model-component.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-component.spec.js","parent":500},{"key":509,"name":"model-dynamic.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-dynamic.spec.js","parent":500},{"key":510,"name":"model-file.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-file.spec.js","parent":500},{"key":511,"name":"model-parse.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-parse.spec.js","parent":500},{"key":512,"name":"model-radio.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-radio.spec.js","parent":500},{"key":513,"name":"model-select.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-select.spec.js","parent":500},{"key":514,"name":"model-text.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/model-text.spec.js","parent":500},{"key":515,"name":"on.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/on.spec.js","parent":500},{"key":516,"name":"once.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/once.spec.js","parent":500},{"key":517,"name":"pre.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/pre.spec.js","parent":500},{"key":518,"name":"show.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/show.spec.js","parent":500},{"key":519,"name":"static-style-parser.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/static-style-parser.spec.js","parent":500},{"key":520,"name":"style.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/style.spec.js","parent":500},{"key":521,"name":"text.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/directives/text.spec.js","parent":500},{"key":522,"name":"error-handling.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/error-handling.spec.js","parent":492},{"key":523,"name":"filter","title":"filter","parent":492},{"key":524,"name":"filter.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/filter/filter.spec.js","parent":523},{"key":525,"name":"global-api","title":"global-api","parent":492},{"key":526,"name":"assets.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/assets.spec.js","parent":525},{"key":527,"name":"compile.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/compile.spec.js","parent":525},{"key":528,"name":"config.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/config.spec.js","parent":525},{"key":529,"name":"extend.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/extend.spec.js","parent":525},{"key":530,"name":"mixin.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/mixin.spec.js","parent":525},{"key":531,"name":"observable.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/observable.spec.js","parent":525},{"key":532,"name":"set-delete.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/set-delete.spec.js","parent":525},{"key":533,"name":"use.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/global-api/use.spec.js","parent":525},{"key":534,"name":"instance","title":"instance","parent":492},{"key":535,"name":"init.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/init.spec.js","parent":534},{"key":536,"name":"methods-data.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/methods-data.spec.js","parent":534},{"key":537,"name":"methods-events.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/methods-events.spec.js","parent":534},{"key":538,"name":"methods-lifecycle.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/methods-lifecycle.spec.js","parent":534},{"key":539,"name":"properties.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/properties.spec.js","parent":534},{"key":540,"name":"render-proxy.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/instance/render-proxy.spec.js","parent":534},{"key":541,"name":"options","title":"options","parent":492},{"key":542,"name":"_scopeId.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/_scopeId.spec.js","parent":541},{"key":543,"name":"comments.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/comments.spec.js","parent":541},{"key":544,"name":"components.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/components.spec.js","parent":541},{"key":545,"name":"computed.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/computed.spec.js","parent":541},{"key":546,"name":"data.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/data.spec.js","parent":541},{"key":547,"name":"delimiters.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/delimiters.spec.js","parent":541},{"key":548,"name":"directives.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/directives.spec.js","parent":541},{"key":549,"name":"el.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/el.spec.js","parent":541},{"key":550,"name":"errorCaptured.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/errorCaptured.spec.js","parent":541},{"key":551,"name":"extends.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/extends.spec.js","parent":541},{"key":552,"name":"functional.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/functional.spec.js","parent":541},{"key":553,"name":"inheritAttrs.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/inheritAttrs.spec.js","parent":541},{"key":554,"name":"inject.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/inject.spec.js","parent":541},{"key":555,"name":"lifecycle.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/lifecycle.spec.js","parent":541},{"key":556,"name":"methods.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/methods.spec.js","parent":541},{"key":557,"name":"mixins.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/mixins.spec.js","parent":541},{"key":558,"name":"name.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/name.spec.js","parent":541},{"key":559,"name":"parent.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/parent.spec.js","parent":541},{"key":560,"name":"props.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/props.spec.js","parent":541},{"key":561,"name":"propsData.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/propsData.spec.js","parent":541},{"key":562,"name":"render.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/render.spec.js","parent":541},{"key":563,"name":"renderError.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/renderError.spec.js","parent":541},{"key":564,"name":"template.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/template.spec.js","parent":541},{"key":565,"name":"watch.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/options/watch.spec.js","parent":541},{"key":566,"name":"ref.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/ref.spec.js","parent":492},{"key":567,"name":"transition","title":"transition","parent":492},{"key":568,"name":"inject-styles.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/transition/inject-styles.js","parent":567},{"key":569,"name":"transition-group.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/transition/transition-group.spec.js","parent":567},{"key":570,"name":"transition-mode.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/transition/transition-mode.spec.js","parent":567},{"key":571,"name":"transition.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/features/transition/transition.spec.js","parent":567},{"key":572,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/test/unit/index.js","parent":490},{"key":573,"name":"karma.base.config.js","title":"/Users/apple/WebstormProjects/vue/test/unit/karma.base.config.js","parent":490},{"key":574,"name":"karma.cover.config.js","title":"/Users/apple/WebstormProjects/vue/test/unit/karma.cover.config.js","parent":490},{"key":575,"name":"karma.dev.config.js","title":"/Users/apple/WebstormProjects/vue/test/unit/karma.dev.config.js","parent":490},{"key":576,"name":"karma.sauce.config.js","title":"/Users/apple/WebstormProjects/vue/test/unit/karma.sauce.config.js","parent":490},{"key":577,"name":"karma.unit.config.js","title":"/Users/apple/WebstormProjects/vue/test/unit/karma.unit.config.js","parent":490},{"key":578,"name":"modules","title":"modules","parent":490},{"key":579,"name":"compiler","title":"compiler","parent":578},{"key":580,"name":"codeframe.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/compiler/codeframe.spec.js","parent":579},{"key":581,"name":"codegen.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/compiler/codegen.spec.js","parent":579},{"key":582,"name":"compiler-options.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/compiler/compiler-options.spec.js","parent":579},{"key":583,"name":"optimizer.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/compiler/optimizer.spec.js","parent":579},{"key":584,"name":"parser.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/compiler/parser.spec.js","parent":579},{"key":585,"name":"observer","title":"observer","parent":578},{"key":586,"name":"dep.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/observer/dep.spec.js","parent":585},{"key":587,"name":"observer.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/observer/observer.spec.js","parent":585},{"key":588,"name":"scheduler.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/observer/scheduler.spec.js","parent":585},{"key":589,"name":"watcher.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/observer/watcher.spec.js","parent":585},{"key":590,"name":"server-compiler","title":"server-compiler","parent":578},{"key":591,"name":"compiler-options.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/server-compiler/compiler-options.spec.js","parent":590},{"key":592,"name":"optimizer.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/server-compiler/optimizer.spec.js","parent":590},{"key":593,"name":"sfc","title":"sfc","parent":578},{"key":594,"name":"sfc-parser.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/sfc/sfc-parser.spec.js","parent":593},{"key":595,"name":"util","title":"util","parent":578},{"key":596,"name":"error.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/util/error.spec.js","parent":595},{"key":597,"name":"next-tick.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/util/next-tick.spec.js","parent":595},{"key":598,"name":"vdom","title":"vdom","parent":578},{"key":599,"name":"create-component.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/create-component.spec.js","parent":598},{"key":600,"name":"create-element.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/create-element.spec.js","parent":598},{"key":601,"name":"modules","title":"modules","parent":598},{"key":602,"name":"attrs.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/attrs.spec.js","parent":601},{"key":603,"name":"class.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/class.spec.js","parent":601},{"key":604,"name":"directive.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/directive.spec.js","parent":601},{"key":605,"name":"dom-props.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/dom-props.spec.js","parent":601},{"key":606,"name":"events.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/events.spec.js","parent":601},{"key":607,"name":"style.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/modules/style.spec.js","parent":601},{"key":608,"name":"patch","title":"patch","parent":598},{"key":609,"name":"children.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/patch/children.spec.js","parent":608},{"key":610,"name":"edge-cases.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/patch/edge-cases.spec.js","parent":608},{"key":611,"name":"element.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/patch/element.spec.js","parent":608},{"key":612,"name":"hooks.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/patch/hooks.spec.js","parent":608},{"key":613,"name":"hydration.spec.js","title":"/Users/apple/WebstormProjects/vue/test/unit/modules/vdom/patch/hydration.spec.js","parent":608},{"key":614,"name":"weex","title":"weex","parent":440},{"key":615,"name":".eslintrc","title":"/Users/apple/WebstormProjects/vue/test/weex/.eslintrc","parent":614},{"key":616,"name":"cases","title":"cases","parent":614},{"key":617,"name":"cases.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/cases.spec.js","parent":616},{"key":618,"name":"event","title":"event","parent":616},{"key":619,"name":"click.after.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/event/click.after.vdom.js","parent":618},{"key":620,"name":"click.before.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/event/click.before.vdom.js","parent":618},{"key":621,"name":"click.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/event/click.vue","parent":618},{"key":622,"name":"recycle-list","title":"recycle-list","parent":616},{"key":623,"name":"attrs.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/attrs.vdom.js","parent":622},{"key":624,"name":"attrs.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/attrs.vue","parent":622},{"key":625,"name":"classname.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/classname.vdom.js","parent":622},{"key":626,"name":"classname.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/classname.vue","parent":622},{"key":627,"name":"components","title":"components","parent":622},{"key":628,"name":"banner.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/banner.vue","parent":627},{"key":629,"name":"counter.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/counter.vue","parent":627},{"key":630,"name":"editor.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/editor.vue","parent":627},{"key":631,"name":"footer.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/footer.vue","parent":627},{"key":632,"name":"lifecycle.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/lifecycle.vue","parent":627},{"key":633,"name":"poster.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/poster.vue","parent":627},{"key":634,"name":"stateful-lifecycle.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful-lifecycle.vdom.js","parent":627},{"key":635,"name":"stateful-lifecycle.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful-lifecycle.vue","parent":627},{"key":636,"name":"stateful-v-model.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful-v-model.vdom.js","parent":627},{"key":637,"name":"stateful-v-model.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful-v-model.vue","parent":627},{"key":638,"name":"stateful.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful.vdom.js","parent":627},{"key":639,"name":"stateful.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateful.vue","parent":627},{"key":640,"name":"stateless-multi-components.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless-multi-components.vdom.js","parent":627},{"key":641,"name":"stateless-multi-components.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless-multi-components.vue","parent":627},{"key":642,"name":"stateless-with-props.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless-with-props.vdom.js","parent":627},{"key":643,"name":"stateless-with-props.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless-with-props.vue","parent":627},{"key":644,"name":"stateless.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless.vdom.js","parent":627},{"key":645,"name":"stateless.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/components/stateless.vue","parent":627},{"key":646,"name":"inline-style.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/inline-style.vdom.js","parent":622},{"key":647,"name":"inline-style.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/inline-style.vue","parent":622},{"key":648,"name":"text-node.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/text-node.vdom.js","parent":622},{"key":649,"name":"text-node.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/text-node.vue","parent":622},{"key":650,"name":"v-else-if.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-else-if.vdom.js","parent":622},{"key":651,"name":"v-else-if.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-else-if.vue","parent":622},{"key":652,"name":"v-else.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-else.vdom.js","parent":622},{"key":653,"name":"v-else.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-else.vue","parent":622},{"key":654,"name":"v-for-iterator.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-for-iterator.vdom.js","parent":622},{"key":655,"name":"v-for-iterator.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-for-iterator.vue","parent":622},{"key":656,"name":"v-for.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-for.vdom.js","parent":622},{"key":657,"name":"v-for.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-for.vue","parent":622},{"key":658,"name":"v-if.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-if.vdom.js","parent":622},{"key":659,"name":"v-if.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-if.vue","parent":622},{"key":660,"name":"v-on-inline.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-on-inline.vdom.js","parent":622},{"key":661,"name":"v-on-inline.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-on-inline.vue","parent":622},{"key":662,"name":"v-on.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-on.vdom.js","parent":622},{"key":663,"name":"v-on.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-on.vue","parent":622},{"key":664,"name":"v-once.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-once.vdom.js","parent":622},{"key":665,"name":"v-once.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/recycle-list/v-once.vue","parent":622},{"key":666,"name":"render","title":"render","parent":616},{"key":667,"name":"class.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/render/class.vdom.js","parent":666},{"key":668,"name":"class.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/render/class.vue","parent":666},{"key":669,"name":"sample.vdom.js","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/render/sample.vdom.js","parent":666},{"key":670,"name":"sample.vue","title":"/Users/apple/WebstormProjects/vue/test/weex/cases/render/sample.vue","parent":666},{"key":671,"name":"compiler","title":"compiler","parent":614},{"key":672,"name":"append.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/append.spec.js","parent":671},{"key":673,"name":"class.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/class.spec.js","parent":671},{"key":674,"name":"compile.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/compile.spec.js","parent":671},{"key":675,"name":"parser.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/parser.spec.js","parent":671},{"key":676,"name":"props.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/props.spec.js","parent":671},{"key":677,"name":"style.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/style.spec.js","parent":671},{"key":678,"name":"v-model.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/compiler/v-model.spec.js","parent":671},{"key":679,"name":"helpers","title":"helpers","parent":614},{"key":680,"name":"index.js","title":"/Users/apple/WebstormProjects/vue/test/weex/helpers/index.js","parent":679},{"key":681,"name":"jasmine.js","title":"/Users/apple/WebstormProjects/vue/test/weex/jasmine.js","parent":614},{"key":682,"name":"runtime","title":"runtime","parent":614},{"key":683,"name":"attrs.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/attrs.spec.js","parent":682},{"key":684,"name":"class.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/class.spec.js","parent":682},{"key":685,"name":"components","title":"components","parent":682},{"key":686,"name":"richtext.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/components/richtext.spec.js","parent":685},{"key":687,"name":"events.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/events.spec.js","parent":682},{"key":688,"name":"framework.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/framework.spec.js","parent":682},{"key":689,"name":"node.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/node.spec.js","parent":682},{"key":690,"name":"style.spec.js","title":"/Users/apple/WebstormProjects/vue/test/weex/runtime/style.spec.js","parent":682},{"key":691,"name":"types","title":"types","parent":1},{"key":692,"name":"index.d.ts","title":"/Users/apple/WebstormProjects/vue/types/index.d.ts","parent":691},{"key":693,"name":"options.d.ts","title":"/Users/apple/WebstormProjects/vue/types/options.d.ts","parent":691},{"key":694,"name":"plugin.d.ts","title":"/Users/apple/WebstormProjects/vue/types/plugin.d.ts","parent":691},{"key":695,"name":"test","title":"test","parent":691},{"key":696,"name":"augmentation-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/augmentation-test.ts","parent":695},{"key":697,"name":"es-module.ts","title":"/Users/apple/WebstormProjects/vue/types/test/es-module.ts","parent":695},{"key":698,"name":"options-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/options-test.ts","parent":695},{"key":699,"name":"plugin-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/plugin-test.ts","parent":695},{"key":700,"name":"ssr-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/ssr-test.ts","parent":695},{"key":701,"name":"tsconfig.json","title":"/Users/apple/WebstormProjects/vue/types/test/tsconfig.json","parent":695},{"key":702,"name":"umd-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/umd-test.ts","parent":695},{"key":703,"name":"vue-test.ts","title":"/Users/apple/WebstormProjects/vue/types/test/vue-test.ts","parent":695},{"key":704,"name":"tsconfig.json","title":"/Users/apple/WebstormProjects/vue/types/tsconfig.json","parent":691},{"key":705,"name":"typings.json","title":"/Users/apple/WebstormProjects/vue/types/typings.json","parent":691},{"key":706,"name":"umd.d.ts","title":"/Users/apple/WebstormProjects/vue/types/umd.d.ts","parent":691},{"key":707,"name":"vnode.d.ts","title":"/Users/apple/WebstormProjects/vue/types/vnode.d.ts","parent":691},{"key":708,"name":"vue.d.ts","title":"/Users/apple/WebstormProjects/vue/types/vue.d.ts","parent":691},{"key":709,"name":"vue.udb","title":"/Users/apple/WebstormProjects/vue/vue.udb","parent":1},{"key":710,"name":"yarn.lock","title":"/Users/apple/WebstormProjects/vue/yarn.lock","parent":1}]}
+    </textarea>
+  </div>
+</div>
+</body>
+</html>

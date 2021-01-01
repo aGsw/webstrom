@@ -1,0 +1,11 @@
+flutter run
+
+fluuter devices
+
+open ios/Runner.xcworkspace
+
+flutter clean
+
+
+目录
+ios-icon-generator   一键生成IOS 图标
