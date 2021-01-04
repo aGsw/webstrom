@@ -96,7 +96,7 @@
               new go.Binding("source", "isTreeLeaf", imageConverter).ofObject()),
             $(go.TextBlock,
               { font: '9pt Verdana, sans-serif' },
-              new go.Binding("text", "key", function(s) { return "item " + s; }))
+              new go.Binding("text", "name", function(s) { return s; }))
           )  // end Horizontal Panel
         );  // end Node
 
@@ -122,6 +122,56 @@
       while (count < max) {
         count = makeTree(3, count, max, nodeDataArray, nodeDataArray[0]);
       }
+      console.log('被渲染的数据……',nodeDataArray)
+      nodeDataArray = [
+    { key: 1, name: 'dir', title: 'root' },
+    {
+      key: 1,
+      name: '.DS_Store',
+      title: '/Users/apple/Desktop/dir/.DS_Store',
+      parent: 1
+    },
+    {
+      key: 2,
+      name: '1.docx',
+      title: '/Users/apple/Desktop/dir/1.docx',
+      parent: 1
+    },
+    {
+      key: 3,
+      name: '2.docx',
+      title: '/Users/apple/Desktop/dir/2.docx',
+      parent: 1
+    },
+    { key: 4, name: '3', title: '3', parent: 1 },
+    {
+      key: 5,
+      name: '33.docx',
+      title: '/Users/apple/Desktop/dir/3/33.docx',
+      parent: 4
+    },
+    { key: 6, name: '4', title: '4', parent: 1 },
+    {
+      key: 7,
+      name: '.DS_Store',
+      title: '/Users/apple/Desktop/dir/4/.DS_Store',
+      parent: 6
+    },
+    {
+      key: 8,
+      name: '44.docx',
+      title: '/Users/apple/Desktop/dir/4/44.docx',
+      parent: 6
+    },
+    { key: 9, name: '4455', title: '4455', parent: 6 },
+    {
+      key: 10,
+      name: '666.docx',
+      title: '/Users/apple/Desktop/dir/4/4455/666.docx',
+      parent: 9
+    }
+  ]
+  console.log('1231',nodeDataArray)
       myDiagram.model = new go.TreeModel(nodeDataArray);
     }
 
